@@ -1,0 +1,31 @@
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['build', '-t', 'us-central1-docker.pkg.dev/$PROJECT_ID/agente-whatsapp-repo/bot:latest', '.']
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', 'us-central1-docker.pkg.dev/$PROJECT_ID/agente-whatsapp-repo/bot:latest']
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: gcloud
+    args:
+      - 'run'
+      - 'deploy'
+      - 'agente-whatsapp-service'
+      - '--image'
+      - 'us-central1-docker.pkg.dev/$PROJECT_ID/agente-whatsapp-repo/bot:latest'
+      - '--region'
+      - 'us-central1'
+      - '--allow-unauthenticated'
+      - '--memory'
+      - '512Mi'
+      - '--max-instances'
+      - '10'
+      - '--timeout'
+      - '60'
+      - '--add-cloudsql-instances'
+      - '$PROJECT_ID:us-central1:langgraph-db'
+      - '--set-env-vars'
+      - 'LANGFUSE_HOST=https://cloud.langfuse.com'
+      - '--set-secrets'
+      - 'OPENWA_TOKEN=OPENWA_TOKEN:latest,OPENAI_API_KEY=OPENAI_API_KEY:latest,CALCOM_API_KEY=CALCOM_API_KEY:latest,LANGFUSE_PUBLIC_KEY=LANGFUSE_PUBLIC_KEY:latest,LANGFUSE_SECRET_KEY=LANGFUSE_SECRET_KEY:latest,DATABASE_URL=DATABASE_URL:latest'
+
+options:
+  logging: CLOUD_LOGGING_ONLY
