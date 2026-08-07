@@ -47,6 +47,7 @@ async def init_db():
         await conn.close()
 
 async def get_user_profile(chat_id: str) -> dict:
+    """Obtiene el perfil de un usuario desde PostgreSQL."""
     conn = await asyncpg.connect(DATABASE_URL)
     try:
         row = await conn.fetchrow(
@@ -58,6 +59,7 @@ async def get_user_profile(chat_id: str) -> dict:
         await conn.close()
 
 async def update_user_profile(chat_id: str, name: str, last_message: str, context: dict = None):
+    """Actualiza o inserta el perfil de un usuario."""
     conn = await asyncpg.connect(DATABASE_URL)
     try:
         await conn.execute("""
@@ -75,37 +77,66 @@ async def update_user_profile(chat_id: str, name: str, last_message: str, contex
 # --- 3. Lifespan ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """Gestiona el ciclo de vida de la aplicación (setup y cleanup)."""
     await checkpointer.setup()
     await init_db()
     yield
 
 app = FastAPI(lifespan=lifespan)
 
-# --- 4. Definir herramientas ---
+# --- 4. Definir herramientas (tools) con docstrings ---
 @tool
 async def show_catalog(chat_id: str) -> str:
+    """
+    Muestra el catálogo de productos al usuario.
+    Args:
+        chat_id: Identificador del chat de WhatsApp.
+    Returns:
+        Mensaje de confirmación.
+    """
     await send_catalog(chat_id)
     return "Catálogo enviado"
 
 @tool
 async def book_appointment(name: str, email: str, date: str, time: str) -> str:
+    """
+    Agenda una cita en Cal.com.
+    Args:
+        name: Nombre del cliente.
+        email: Correo electrónico del cliente.
+        date: Fecha de la cita (YYYY-MM-DD).
+        time: Hora de la cita (HH:MM).
+    Returns:
+        Mensaje de confirmación con ID de la cita.
+    """
     booking = await create_booking(name, email, date, time)
     return f"Cita agendada para {date} a las {time}. ID: {booking['id']}"
 
 @tool
 async def send_message(chat_id: str, text: str) -> str:
+    """
+    Envía un mensaje de texto al usuario.
+    Args:
+        chat_id: Identificador del chat de WhatsApp.
+        text: Texto del mensaje.
+    Returns:
+        Mensaje de confirmación.
+    """
     await send_text_message(chat_id, text)
     return "Mensaje enviado"
 
 tools = [show_catalog, book_appointment, send_message]
 tool_executor = ToolExecutor(tools)
 
-# --- 5. LLM ---
+# --- 5. Definir el LLM con binding de herramientas ---
 llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.3)
 llm_with_tools = llm.bind_tools(tools)
 
 # --- 6. Nodos del grafo ---
 async def classify_intent(state: AgentState) -> Dict[str, Any]:
+    """
+    Clasifica la intención del usuario usando el LLM.
+    """
     messages = state.messages.copy()
     system_prompt = (
         "Eres un asistente de perfumería. Clasifica la intención del usuario en: "
@@ -130,21 +161,30 @@ async def classify_intent(state: AgentState) -> Dict[str, Any]:
     return {"next_step": next_step, "messages": state.messages}
 
 async def handle_catalog(state: AgentState) -> Dict[str, Any]:
+    """
+    Ejecuta la herramienta de catálogo.
+    """
     result = await show_catalog(state.chat_id)
     await send_text_message(state.chat_id, "Aquí tienes nuestro catálogo. ¿Te gusta algún producto?")
     return {"messages": state.messages + [AIMessage(content=result)]}
 
 async def handle_schedule(state: AgentState) -> Dict[str, Any]:
+    """
+    Maneja el agendamiento de citas.
+    """
     await send_text_message(state.chat_id, "Para agendar, por favor dinos tu nombre, correo, fecha (YYYY-MM-DD) y hora (HH:MM).")
     return {"messages": state.messages + [AIMessage(content="Solicitando datos de cita.")]}
 
 async def handle_respond(state: AgentState) -> Dict[str, Any]:
+    """
+    Genera una respuesta general usando el LLM.
+    """
     handler = get_langfuse_handler(user_id=state.chat_id)
     response = await llm.ainvoke(state.messages, config={"callbacks": [handler]})
     await send_text_message(state.chat_id, response.content)
     return {"messages": state.messages + [AIMessage(content=response.content)]}
 
-# --- 7. Grafo ---
+# --- 7. Construcción del grafo ---
 workflow = StateGraph(AgentState)
 workflow.add_node("classify", classify_intent)
 workflow.add_node("catalog", handle_catalog)
@@ -170,6 +210,9 @@ graph = workflow.compile(checkpointer=checkpointer)
 # --- 8. Endpoints ---
 @app.post("/webhook")
 async def whatsapp_webhook(request: Request, background_tasks: BackgroundTasks):
+    """
+    Endpoint que recibe los webhooks de OpenWA.
+    """
     data = await request.json()
     chat_id = data.get("chatId")
     message_text = data.get("body", "")
@@ -178,6 +221,9 @@ async def whatsapp_webhook(request: Request, background_tasks: BackgroundTasks):
     return {"status": "ok"}
 
 async def process_message(chat_id: str, message: str, sender_name: str):
+    """
+    Procesa el mensaje con el agente de LangGraph y registra en Langfuse.
+    """
     trace = langfuse_client.trace(
         name="whatsapp-conversation",
         user_id=chat_id,
@@ -212,10 +258,16 @@ async def process_message(chat_id: str, message: str, sender_name: str):
 
 @app.post("/webhook/calcom")
 async def calcom_webhook(request: Request):
+    """
+    Endpoint que recibe webhooks de Cal.com.
+    """
     data = await request.json()
     print(f"Booking creado: {data}")
     return {"status": "ok"}
 
 @app.get("/health")
 async def health():
+    """
+    Endpoint de salud para verificar que la aplicación está funcionando.
+    """
     return {"status": "healthy"}
