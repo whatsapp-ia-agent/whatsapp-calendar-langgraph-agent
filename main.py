@@ -20,7 +20,10 @@ from models import AgentState
 
 # --- 1. Configuración inicial ---
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-DATABASE_URL = os.getenv("DATABASE_URL")  # PostgreSQL en Railway
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+if not DATABASE_URL:
+    raise ValueError("DATABASE_URL environment variable is required")
 
 # Checkpointer de PostgreSQL
 checkpointer = PostgresSaver.from_conn_string(DATABASE_URL)
@@ -39,27 +42,22 @@ async def init_db():
                 updated_at TIMESTAMP DEFAULT NOW()
             );
         """)
-        # También creamos índices si se necesitan
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_user_profiles_updated ON user_profiles(updated_at);")
     finally:
         await conn.close()
 
 async def get_user_profile(chat_id: str) -> dict:
-    """Obtiene el perfil de un usuario desde PostgreSQL."""
     conn = await asyncpg.connect(DATABASE_URL)
     try:
         row = await conn.fetchrow(
             "SELECT chat_id, user_name, last_message, context FROM user_profiles WHERE chat_id = $1",
             chat_id
         )
-        if row:
-            return dict(row)
-        return None
+        return dict(row) if row else None
     finally:
         await conn.close()
 
 async def update_user_profile(chat_id: str, name: str, last_message: str, context: dict = None):
-    """Actualiza o inserta el perfil de un usuario."""
     conn = await asyncpg.connect(DATABASE_URL)
     try:
         await conn.execute("""
@@ -74,50 +72,40 @@ async def update_user_profile(chat_id: str, name: str, last_message: str, contex
     finally:
         await conn.close()
 
-# --- 3. Lifespan (se ejecuta al iniciar y cerrar) ---
+# --- 3. Lifespan ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Setup de checkpointer (LangGraph)
     await checkpointer.setup()
-    # Crear tablas para perfiles de usuario
     await init_db()
     yield
-    # Cierre de conexiones si es necesario
 
 app = FastAPI(lifespan=lifespan)
 
-# --- 4. Definir herramientas (tools) ---
+# --- 4. Definir herramientas ---
 @tool
 async def show_catalog(chat_id: str) -> str:
-    """Muestra el catálogo de productos al usuario."""
     await send_catalog(chat_id)
     return "Catálogo enviado"
 
 @tool
 async def book_appointment(name: str, email: str, date: str, time: str) -> str:
-    """Agenda una cita en Cal.com."""
     booking = await create_booking(name, email, date, time)
     return f"Cita agendada para {date} a las {time}. ID: {booking['id']}"
 
 @tool
 async def send_message(chat_id: str, text: str) -> str:
-    """Envía un mensaje de texto al usuario."""
     await send_text_message(chat_id, text)
     return "Mensaje enviado"
 
 tools = [show_catalog, book_appointment, send_message]
 tool_executor = ToolExecutor(tools)
 
-# --- 5. Definir el LLM con binding de herramientas ---
+# --- 5. LLM ---
 llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.3)
 llm_with_tools = llm.bind_tools(tools)
 
 # --- 6. Nodos del grafo ---
-
 async def classify_intent(state: AgentState) -> Dict[str, Any]:
-    """
-    Clasifica la intención del usuario usando el LLM.
-    """
     messages = state.messages.copy()
     system_prompt = (
         "Eres un asistente de perfumería. Clasifica la intención del usuario en: "
@@ -156,7 +144,7 @@ async def handle_respond(state: AgentState) -> Dict[str, Any]:
     await send_text_message(state.chat_id, response.content)
     return {"messages": state.messages + [AIMessage(content=response.content)]}
 
-# --- 7. Construcción del grafo ---
+# --- 7. Grafo ---
 workflow = StateGraph(AgentState)
 workflow.add_node("classify", classify_intent)
 workflow.add_node("catalog", handle_catalog)
@@ -164,7 +152,6 @@ workflow.add_node("schedule", handle_schedule)
 workflow.add_node("respond", handle_respond)
 
 workflow.set_entry_point("classify")
-
 workflow.add_conditional_edges(
     "classify",
     lambda state: state.next_step,
@@ -180,8 +167,7 @@ workflow.add_edge("respond", END)
 
 graph = workflow.compile(checkpointer=checkpointer)
 
-# --- 8. FastAPI Endpoints ---
-
+# --- 8. Endpoints ---
 @app.post("/webhook")
 async def whatsapp_webhook(request: Request, background_tasks: BackgroundTasks):
     data = await request.json()
@@ -206,21 +192,15 @@ async def process_message(chat_id: str, message: str, sender_name: str):
         )
 
         thread_config = {"configurable": {"thread_id": chat_id}}
-        
-        # 🔥 CORRECCIÓN: Combinar configuraciones sin repetir argumento
         full_config = {**thread_config, "callbacks": [get_langfuse_handler(user_id=chat_id, session_id=chat_id)]}
 
         try:
-            final_state = await graph.ainvoke(
-                initial_state.dict(),
-                config=full_config
-            )
+            final_state = await graph.ainvoke(initial_state.dict(), config=full_config)
             span.update(output=final_state)
         except Exception as e:
             span.update(status="error", status_message=str(e))
             raise
 
-        # Guardar perfil en PostgreSQL en lugar de Firestore
         await update_user_profile(
             chat_id=chat_id,
             name=sender_name,
