@@ -1,6 +1,6 @@
 FROM python:3.11-slim
 
-# Instalar dependencias del sistema necesarias para psycopg
+# Instalar dependencias del sistema necesarias para psycopg (PostgreSQL)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     libpq-dev \
