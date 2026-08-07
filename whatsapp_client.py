@@ -1,10 +1,9 @@
 import os
 from openwa import AsyncOpenWAClient
 
-# OPENWA_TOKEN es la API Key generada al levantar OpenWA por primera vez
 OPENWA_URL = os.getenv("OPENWA_URL", "http://localhost:2785")
-OPENWA_API_KEY = os.getenv("OPENWA_TOKEN")  # ← Usa OPENWA_TOKEN
-SESSION_ID = os.getenv("SESSION_ID", "whatsapp-session")  # ← Nombre de tu sesión
+OPENWA_API_KEY = os.getenv("OPENWA_TOKEN")  # ← Usa OPENWA_TOKEN (la variable que tienes)
+SESSION_ID = os.getenv("SESSION_ID", "whatsapp-session")
 
 if not OPENWA_API_KEY:
     raise ValueError("OPENWA_TOKEN environment variable is required")
