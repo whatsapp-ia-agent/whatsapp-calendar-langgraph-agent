@@ -1,5 +1,5 @@
 import os
-import asyncio
+import asyncpg
 from fastapi import FastAPI, Request, BackgroundTasks
 from contextlib import asynccontextmanager
 from typing import Dict, Any
@@ -18,22 +18,43 @@ from calcom_client import check_availability, create_booking
 from langfuse_setup import get_langfuse_handler, langfuse_client
 from models import AgentState
 
-# Google Cloud Firestore (para cache de perfil)
-from google.cloud import firestore
-db_firestore = firestore.AsyncClient()
-
 # --- 1. Configuración inicial ---
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-DATABASE_URL = os.getenv("DATABASE_URL")  # postgresql://user:pass@/db?host=/cloudsql/...
+DATABASE_URL = os.getenv("DATABASE_URL")  # postgresql://user:pass@host:port/db
 
 # Checkpointer de PostgreSQL
 checkpointer = PostgresSaver.from_conn_string(DATABASE_URL)
 
-# Inicializar el grafo una sola vez al levantar el servicio
+# --- Función para crear tablas automáticamente ---
+async def init_db():
+    """Crea las tablas necesarias si no existen."""
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        # Tabla para perfiles de usuario (reemplaza Firestore)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_profiles (
+                chat_id TEXT PRIMARY KEY,
+                user_name TEXT,
+                last_message TEXT,
+                context JSONB,
+                updated_at TIMESTAMP DEFAULT NOW()
+            );
+        """)
+        print("✅ Tabla 'user_profiles' verificada/creada.")
+    finally:
+        await conn.close()
+
+# --- Lifespan para inicializar todo ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Setup de checkpointer
+    # 1. Setup del checkpointer de LangGraph
     await checkpointer.setup()
+    print("✅ Checkpointer de LangGraph inicializado.")
+    
+    # 2. Crear tablas adicionales (perfiles de usuario)
+    await init_db()
+    print("✅ Base de datos lista.")
+    
     yield
     # Cierre de conexiones si es necesario
 
@@ -65,15 +86,45 @@ tool_executor = ToolExecutor(tools)
 llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.3)
 llm_with_tools = llm.bind_tools(tools)
 
-# --- 4. Nodos del grafo ---
+# --- 4. Funciones auxiliares para perfiles de usuario (reemplaza Firestore) ---
+async def get_user_profile(chat_id: str) -> Dict[str, Any]:
+    """Obtiene el perfil de un usuario desde PostgreSQL."""
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        row = await conn.fetchrow(
+            "SELECT chat_id, user_name, last_message, context FROM user_profiles WHERE chat_id = $1",
+            chat_id
+        )
+        if row:
+            return {
+                "chat_id": row["chat_id"],
+                "user_name": row["user_name"],
+                "last_message": row["last_message"],
+                "context": row["context"] or {}
+            }
+        return {}
+    finally:
+        await conn.close()
 
+async def update_user_profile(chat_id: str, data: Dict[str, Any]):
+    """Actualiza o crea el perfil de un usuario en PostgreSQL."""
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        await conn.execute("""
+            INSERT INTO user_profiles (chat_id, user_name, last_message, context)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (chat_id) DO UPDATE SET
+                user_name = EXCLUDED.user_name,
+                last_message = EXCLUDED.last_message,
+                context = EXCLUDED.context,
+                updated_at = NOW()
+        """, chat_id, data.get("user_name"), data.get("last_message"), data.get("context"))
+    finally:
+        await conn.close()
+
+# --- 5. Nodos del grafo ---
 async def classify_intent(state: AgentState) -> Dict[str, Any]:
-    """
-    Clasifica la intención del usuario usando el LLM.
-    """
-    # Construir mensajes para el LLM
     messages = state.messages.copy()
-    # Añadir un prompt de sistema
     system_prompt = (
         "Eres un asistente de perfumería. Clasifica la intención del usuario en: "
         "'catalog' si quiere ver productos, 'schedule' si quiere agendar cita, "
@@ -82,11 +133,9 @@ async def classify_intent(state: AgentState) -> Dict[str, Any]:
     )
     messages.insert(0, HumanMessage(content=system_prompt))
     
-    # Llamar al LLM con callback de Langfuse
     handler = get_langfuse_handler(user_id=state.chat_id)
     response = await llm.ainvoke(messages, config={"callbacks": [handler]})
     
-    # Parsear la respuesta (simplificado, en producción usarías JSON)
     content = response.content
     if "catalog" in content.lower():
         next_step = "catalog"
@@ -95,40 +144,25 @@ async def classify_intent(state: AgentState) -> Dict[str, Any]:
     else:
         next_step = "respond"
     
-    # Guardar la respuesta en el estado
     state.messages.append(AIMessage(content=content))
     return {"next_step": next_step, "messages": state.messages}
 
 async def handle_catalog(state: AgentState) -> Dict[str, Any]:
-    """
-    Ejecuta la herramienta de catálogo.
-    """
     result = await show_catalog(state.chat_id)
-    # Responder con un mensaje de texto
     await send_text_message(state.chat_id, "Aquí tienes nuestro catálogo. ¿Te gusta algún producto?")
     return {"messages": state.messages + [AIMessage(content=result)]}
 
 async def handle_schedule(state: AgentState) -> Dict[str, Any]:
-    """
-    Maneja el agendamiento. Extrae nombre, email, fecha y hora de la conversación.
-    En producción usarías un sistema de extracción de entidades.
-    """
-    # Simulación: extraer datos del mensaje (deberías usar un parser o pedir al usuario)
-    # Por ahora, pedimos los datos al usuario mediante mensajes.
     await send_text_message(state.chat_id, "Para agendar, por favor dinos tu nombre, correo, fecha (YYYY-MM-DD) y hora (HH:MM).")
-    # Aquí deberías guardar un estado intermedio para esperar la respuesta.
     return {"messages": state.messages + [AIMessage(content="Solicitando datos de cita.")]}
 
 async def handle_respond(state: AgentState) -> Dict[str, Any]:
-    """
-    Genera una respuesta general usando el LLM.
-    """
     handler = get_langfuse_handler(user_id=state.chat_id)
     response = await llm.ainvoke(state.messages, config={"callbacks": [handler]})
     await send_text_message(state.chat_id, response.content)
     return {"messages": state.messages + [AIMessage(content=response.content)]}
 
-# --- 5. Construcción del grafo ---
+# --- 6. Construcción del grafo ---
 workflow = StateGraph(AgentState)
 workflow.add_node("classify", classify_intent)
 workflow.add_node("catalog", handle_catalog)
@@ -137,7 +171,6 @@ workflow.add_node("respond", handle_respond)
 
 workflow.set_entry_point("classify")
 
-# Transiciones condicionales
 workflow.add_conditional_edges(
     "classify",
     lambda state: state.next_step,
@@ -151,51 +184,36 @@ workflow.add_edge("catalog", END)
 workflow.add_edge("schedule", END)
 workflow.add_edge("respond", END)
 
-# Compilar el grafo con el checkpointer de PostgreSQL
 graph = workflow.compile(checkpointer=checkpointer)
 
-# --- 6. FastAPI Endpoints ---
-
+# --- 7. FastAPI Endpoints ---
 @app.post("/webhook")
 async def whatsapp_webhook(request: Request, background_tasks: BackgroundTasks):
-    """
-    Webhook que recibe los mensajes de OpenWA.
-    """
     data = await request.json()
     chat_id = data.get("chatId")
     message_text = data.get("body", "")
     sender_name = data.get("senderName", "")
-
-    # Iniciar una traza raíz con Langfuse usando el decorador manual
-    # Usamos background_tasks para no bloquear la respuesta de OpenWA
+    
     background_tasks.add_task(process_message, chat_id, message_text, sender_name)
     return {"status": "ok"}
 
 async def process_message(chat_id: str, message: str, sender_name: str):
-    """
-    Procesa el mensaje con el agente de LangGraph, envolviendo con Langfuse.
-    """
-    # Creamos una traza con Langfuse de forma manual para todo el proceso
     trace = langfuse_client.trace(
         name="whatsapp-conversation",
         user_id=chat_id,
         metadata={"sender_name": sender_name}
     )
-
-    # Obtener el span para la ejecución del grafo
+    
     with trace.span(name="langgraph-execution") as span:
-        # Estado inicial
         initial_state = AgentState(
             messages=[{"role": "user", "content": message}],
             chat_id=chat_id,
             user_name=sender_name,
         )
-
-        # Configuración para el checkpointer (thread_id = chat_id)
+        
         config = {"configurable": {"thread_id": chat_id}}
-
-        # Invocar el grafo con el callback handler de Langfuse
         handler = get_langfuse_handler(user_id=chat_id, session_id=chat_id)
+        
         try:
             final_state = await graph.ainvoke(
                 initial_state.dict(),
@@ -206,28 +224,22 @@ async def process_message(chat_id: str, message: str, sender_name: str):
         except Exception as e:
             span.update(status="error", status_message=str(e))
             raise
-
-        # Actualizar el perfil en Firestore con la información extraída
-        # (simplificado: guardamos el último mensaje)
-        user_ref = db_firestore.collection("users").document(chat_id)
-        await user_ref.set({"last_message": message, "name": sender_name}, merge=True)
-
-    # Finalizar la traza
+        
+        # Actualizar perfil en PostgreSQL (reemplaza Firestore)
+        await update_user_profile(chat_id, {
+            "user_name": sender_name,
+            "last_message": message,
+            "context": {}  # Puedes guardar más datos aquí
+        })
+    
     trace.flush()
 
 @app.post("/webhook/calcom")
 async def calcom_webhook(request: Request):
-    """
-    Webhook que recibe notificaciones de Cal.com (booking creado).
-    """
     data = await request.json()
-    # Aquí se puede programar un recordatorio con un scheduler (por ejemplo, Celery o BackgroundTasks)
-    # Por simplicidad, solo lo logueamos
     print(f"Booking creado: {data}")
-    # Podríamos enviar un mensaje de confirmación por WhatsApp
     return {"status": "ok"}
 
-# Endpoint de salud para GCP
 @app.get("/health")
 async def health():
     return {"status": "healthy"}
