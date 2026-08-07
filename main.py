@@ -42,6 +42,7 @@ async def init_db():
         await conn.close()
 
 async def update_user_profile(chat_id: str, name: str, last_message: str, context: dict = None):
+    """Actualiza o inserta el perfil de un usuario."""
     conn = await asyncpg.connect(DATABASE_URL)
     try:
         await conn.execute("""
@@ -56,19 +57,22 @@ async def update_user_profile(chat_id: str, name: str, last_message: str, contex
     finally:
         await conn.close()
 
-# --- 3. Definir herramientas ---
+# --- 3. Definir herramientas (tools) con docstring obligatorio ---
 @tool
 async def show_catalog(chat_id: str) -> str:
+    """Muestra el catálogo de productos al usuario."""
     await send_catalog(chat_id)
     return "Catálogo enviado"
 
 @tool
 async def book_appointment(name: str, email: str, date: str, time: str) -> str:
+    """Agenda una cita en Cal.com."""
     booking = await create_booking(name, email, date, time)
     return f"Cita agendada para {date} a las {time}. ID: {booking['id']}"
 
 @tool
 async def send_message(chat_id: str, text: str) -> str:
+    """Envía un mensaje de texto al usuario."""
     await send_text_message(chat_id, text)
     return "Mensaje enviado"
 
@@ -119,7 +123,7 @@ async def handle_respond(state: AgentState) -> Dict[str, Any]:
     await send_text_message(state.chat_id, response.content)
     return {"messages": state.messages + [AIMessage(content=response.content)]}
 
-# --- 6. Construcción del grafo (se compila en lifespan) ---
+# --- 6. Construcción del grafo ---
 workflow = StateGraph(AgentState)
 workflow.add_node("classify", classify_intent)
 workflow.add_node("catalog", handle_catalog)
@@ -147,15 +151,11 @@ graph = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global graph
-    # Conectar a PostgreSQL y configurar checkpointer
     async with PostgresSaver.from_conn_string(DATABASE_URL) as checkpointer:
         await checkpointer.setup()
-        # Crear tablas para perfiles de usuario
         await init_db()
-        # Compilar el grafo con el checkpointer
         graph = workflow.compile(checkpointer=checkpointer)
         yield
-    # Al salir, se cierra la conexión automáticamente
 
 app = FastAPI(lifespan=lifespan)
 
